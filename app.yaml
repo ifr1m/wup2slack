@@ -1,0 +1,6 @@
+runtime: go122
+env_variables:
+  GRAPH_API_TOKEN_SECRET_NAME: "projects/971659166940/secrets/GRAPH_API_TOKEN/versions/3" # add Whatsapp business platform token in Google SecretManger and update accordingly
+  SLACK_BOT_TOKEN_SECRET_NAME: "projects/971659166940/secrets/SLACK_BOT_TOKEN/versions/1" # add Slack bot app token in Google SecretManger and update accordingly
+  WUP_WEBHOOK_VERIFY_TOKEN_SECRET_NAME: "projects/971659166940/secrets/WUP_WEBHOOK_VERIFY_TOKEN/versions/1" # add a random string of your choosing in Google SecretManger and update accordingly - this is used when registering the whatsapp webhook
+  LINKED_ACCOUNTS_FILE_STORE: "linked_accounts_demo.json" # this should point to your version of 'linked_accounts.json'

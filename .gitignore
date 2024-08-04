@@ -23,3 +23,11 @@ go.work.sum
 
 # env file
 .env
+
+# others
+.make
+api_examples
+wup2slackDemo.mp4
+todo.txt
+linked_accounts_demo.json
+.idea
