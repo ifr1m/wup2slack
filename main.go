@@ -8,9 +8,13 @@ import (
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/go-redsync/redsync/v4"
+	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	"github.com/gorilla/mux"
 	fastshot "github.com/opus-domini/fast-shot"
+	goredislib "github.com/redis/go-redis/v9"
 	"github.com/slack-go/slack"
 	"github.com/valyala/fastjson"
 	"github.com/ztrue/tracerr"
@@ -19,7 +23,14 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
+
+type SendSlackMessage struct {
+	ChannelId string `json:"channel_id"`
+	Message   string `json:"message"`
+	AsUser    string `json:"as_user"`
+}
 
 type Wup2SlackError struct {
 	ErrorMessage string
@@ -228,6 +239,13 @@ func (t WhatsappInitiatorDetails) getDefaultSlackChannelName() string {
 	return fmt.Sprintf("%s-%s", strings.ToLower(t.Name), strings.ToLower(t.WhatsappPhoneNumber))
 }
 
+type RedisClient interface {
+	LPush(ctx context.Context, key string, values ...interface{}) *goredislib.IntCmd
+}
+type RedisClientS struct {
+	*goredislib.Client
+}
+
 func main() {
 	ctx := context.Background()
 	smClient, err := secretmanager.NewClient(ctx)
@@ -267,12 +285,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create linked account store %+v\n", err)
 	}
+
+	//TODO update to use Gcloud connection
+	redisClient := goredislib.NewClient(&goredislib.Options{
+		Addr:     "localhost:6379",
+		Password: "", // no password set
+		DB:       0,  // use default DB
+	})
+
+	pool := goredis.NewPool(redisClient) // or, pool := redigo.NewPool(...)
+	rs := redsync.New(pool)
+	slackMessageQueueMutex := rs.NewMutex("slackMessageQueueMutex")
+
+	go processSlackSendMessageRequests(slackClient, redisClient, slackMessageQueueMutex)
+
 	r := mux.NewRouter()
 	r.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		writer.Write([]byte("Nothing to see here."))
 	})
 	r.HandleFunc("/whatsapp/webhook", resolveWhatsappVerificationChallenge(string(whatsappWebhookVerifyToken.Payload.Data))).Queries().Methods("GET")
-	r.HandleFunc("/whatsapp/webhook", handleWhatsappInitiatedMessage(fbClient, slackClient, linkedAccountStore))
+	r.HandleFunc("/whatsapp/webhook", handleWhatsappInitiatedMessage(fbClient, slackClient, linkedAccountStore, &RedisClientS{redisClient}))
 	r.HandleFunc("/slack/webhook", handleSlackInitiatedMessage(fbClient, slackClient, linkedAccountStore))
 	log.Println("Listening on port: 8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
@@ -302,7 +334,7 @@ func resolveWhatsappVerificationChallenge(whatsappWebhookVerifyToken string) htt
 	}
 }
 
-func handleWhatsappInitiatedMessage(fbClient FbClient, slackClient SlackClient, store LinkedAccountStore) http.HandlerFunc {
+func handleWhatsappInitiatedMessage(fbClient FbClient, slackClient SlackClient, store LinkedAccountStore, rdb RedisClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		bodyValue, err := getBody(r)
 		if err != nil {
@@ -330,10 +362,15 @@ func handleWhatsappInitiatedMessage(fbClient FbClient, slackClient SlackClient, 
 				return
 			}
 
-			//forward whatsapp message to slack.
-			_, _, _, err = slackClient.postMessageAsUser(channel.ID, string(newMessage.GetStringBytes("text", "body")), initiatorDetails.Name)
+			postMessageAsUserRequest := SendSlackMessage{ChannelId: channel.ID, Message: string(newMessage.GetStringBytes("text", "body")), AsUser: initiatorDetails.Name}
+			postMessageAsUserRequestString, err := json.Marshal(postMessageAsUserRequest)
 			if err != nil {
-				handleInternalError(w, err, "Error forwarding whatsapp message to slack")
+				handleInternalError(w, err, "Error marshalling slack post message")
+			}
+			//add to redis instead of calling directly slack, in order to deal with slack rate limit
+			err = rdb.LPush(context.Background(), "slackMessageQueue", postMessageAsUserRequestString).Err()
+			if err != nil {
+				handleInternalError(w, err, "Error pushing message to Redis queue")
 				return
 			}
 
@@ -346,6 +383,47 @@ func handleWhatsappInitiatedMessage(fbClient FbClient, slackClient SlackClient, 
 			w.WriteHeader(http.StatusOK)
 		}
 
+	}
+}
+
+func processSlackSendMessageRequests(slackClient SlackClient, redisClient *goredislib.Client, slackMessageQueueMutex *redsync.Mutex) {
+	for {
+		if err := slackMessageQueueMutex.Lock(); err != nil {
+			tracerr.PrintSource(tracerr.Wrap(err))
+		}
+		result, err := redisClient.BRPop(context.Background(), 0, "slackMessageQueue").Result()
+		if err != nil {
+			tracerr.PrintSource(tracerr.Wrap(NewWup2SlackError("Error popping from Redis queue", err)))
+			unlock(slackMessageQueueMutex)
+			continue
+		}
+
+		var messageData SendSlackMessage
+		err = json.Unmarshal([]byte(result[1]), &messageData)
+		if err != nil {
+			tracerr.PrintSource(tracerr.Wrap(NewWup2SlackError("Error unmarshalling message data", err)))
+			unlock(slackMessageQueueMutex)
+			continue
+		}
+		//forward whatsapp message to slack
+		_, _, _, err = slackClient.postMessageAsUser(messageData.ChannelId, messageData.Message, messageData.AsUser)
+		var rateLimitError *slack.RateLimitedError
+		if err != nil && errors.As(err, &rateLimitError) {
+			redisClient.RPush(context.Background(), "slackMessageQueue", result[1])
+			unlock(slackMessageQueueMutex)
+			time.Sleep(rateLimitError.RetryAfter)
+		} else if err != nil {
+			tracerr.PrintSource(tracerr.Wrap(NewWup2SlackError("Error forwarding message to slack", err)))
+			unlock(slackMessageQueueMutex)
+			continue
+		}
+		unlock(slackMessageQueueMutex)
+	}
+}
+
+func unlock(slackMessageQueueMutex *redsync.Mutex) {
+	if ok, err := slackMessageQueueMutex.Unlock(); (!ok || err != nil) && !errors.Is(err, redsync.ErrLockAlreadyExpired) {
+		tracerr.PrintSource(tracerr.Wrap(NewWup2SlackError("Error unlocking", err)))
 	}
 }
 

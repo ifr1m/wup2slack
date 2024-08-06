@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	fastshot "github.com/opus-domini/fast-shot"
+	goredislib "github.com/redis/go-redis/v9"
 	"github.com/slack-go/slack"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
@@ -18,16 +19,17 @@ func TestHandleWhatsappInitiatedMessage(t *testing.T) {
 	mockFbClient := NewMockFbClient(ctrl)
 	mockSlackClient := NewMockSlackClient(ctrl)
 	mockLinkedAccount := NewMockLinkedAccountStore(ctrl)
+	mockRedisClient := NewMockRedisClient(ctrl)
 
 	mockFbClient.EXPECT().
 		markWhatsappMessageAsRead("36825", "message_id_123").
 		Return(fastshot.Response{}, nil)
 
 	mockSlackClient.EXPECT().getSlackChannel(gomock.Any(), gomock.Any()).Return(slack.Channel{}, nil)
-	mockSlackClient.EXPECT().postMessageAsUser(gomock.Any(), "message from whatsapp", "Bob").Return("", "", "", nil)
 	mockLinkedAccount.EXPECT().lookupLinkedAccount(gomock.Any()).Return(&LinkedAccount{WhatsappBusinessPhoneNumberId: "36825", SlackUserId: "slack_123"}, nil)
+	mockRedisClient.EXPECT().LPush(gomock.Any(), gomock.Any(), gomock.Any()).Return(goredislib.NewIntCmd(nil))
 
-	handler := handleWhatsappInitiatedMessage(mockFbClient, mockSlackClient, mockLinkedAccount)
+	handler := handleWhatsappInitiatedMessage(mockFbClient, mockSlackClient, mockLinkedAccount, mockRedisClient)
 
 	body := `{
     "object": "whatsapp_business_account",
